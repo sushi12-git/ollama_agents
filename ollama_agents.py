@@ -1099,7 +1099,7 @@ class Skill:
         parts = line.strip().split(None, 1)
         if not parts:
             return False
-        cmd = parts[0].lower()
+        cmd = parts[0].lower().lstrip("/")
         return cmd == self.name.lower() or cmd in [a.lower() for a in self.aliases]
 
 
