@@ -457,9 +457,20 @@ def search_docs(query, top_k=None):
 # --- File tools -------------------------------------------------------------
 
 def _resolve_path(path):
-    """Resolve a path; return absolute path or None if disallowed."""
-    abs_path = os.path.abspath(path)
-    return abs_path
+    """Resolve a path; expand home and normalize Windows placeholder users."""
+    if not path:
+        return os.path.abspath("")
+
+    resolved = os.path.expanduser(path)
+    if os.name == "nt":
+        user_home = os.path.expanduser("~")
+        current_user = os.path.basename(user_home)
+        resolved = resolved.replace("YOUR_USER", current_user)
+        resolved = resolved.replace("your_user", current_user)
+        resolved = resolved.replace("C:\\Users\\" + current_user, user_home)
+        resolved = resolved.replace("C:/Users/" + current_user, user_home)
+
+    return os.path.abspath(resolved)
 
 
 def tool_read_file(path):
@@ -1298,6 +1309,157 @@ def _load_command(args, ctx):
     return None
 
 
+def _split_task_for_agents(task, count):
+    import re
+    text = (task or "").strip()
+    if not text:
+        return [f"Subtask {i + 1} of {count}: continue the task." for i in range(count)]
+
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
+    if not sentences:
+        words = text.split()
+        if len(words) <= count:
+            return [w for w in words] or [text]
+        parts = []
+        for i in range(count):
+            start = i * len(words) // count
+            end = (i + 1) * len(words) // count
+            parts.append(" ".join(words[start:end]).strip())
+        return parts
+
+    if len(sentences) <= count:
+        return sentences[:count] + [f"Subtask {len(sentences) + 1} of {count}: continue the task." for _ in range(count - len(sentences))]
+
+    per_agent = len(sentences) // count
+    remainder = len(sentences) % count
+    chunks = []
+    start = 0
+    for i in range(count):
+        size = per_agent + (1 if i < remainder else 0)
+        end = start + size
+        chunks.append(" ".join(sentences[start:end]).strip())
+        start = end
+    return chunks
+
+
+def _extract_model_size(model_name):
+    import re
+    match = re.search(r"(\d+(?:\.\d+)?)\s*b", (model_name or "").lower())
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except Exception:
+        return None
+
+
+def _resolve_spawn_model(model, ctx):
+    requested_size = _extract_model_size(model)
+    if requested_size is not None and requested_size <= 2.0:
+        return model
+
+    try:
+        available = ollama_request("/api/tags").get("models", [])
+    except Exception as e:
+        warn(f"Could not list available models for spawn: {e}")
+        return None
+
+    candidates = []
+    for entry in available:
+        name = (entry or {}).get("name") or ""
+        size = _extract_model_size(name)
+        if size is None or size > 2.0:
+            continue
+        candidates.append(name)
+
+    if not candidates:
+        warn("Spawn requires a 2B-or-smaller model, but none are currently available.")
+        return None
+
+    preferred = [n for n in candidates if "qwen3.5:2b" in n.lower() or "qwen3.5:1b" in n.lower()]
+    return preferred[0] if preferred else candidates[0]
+
+
+def _synthesize_spawn_results(model, task, results, ctx):
+    synthesis_messages = [{"role": "system", "content": build_system_prompt(ctx)}]
+    synthesis_messages.append({
+        "role": "user",
+        "content": (
+            "You are the final synthesis agent. Combine the subagent outputs below into one "
+            "brief, structured summary. Keep the answer concise, readable, and action-oriented.\n\n"
+            f"Original task: {task}\n\n"
+            "Subagent outputs:\n"
+            + "\n\n".join(results)
+        ),
+    })
+
+    try:
+        if ctx.get("_supports_tools"):
+            return run_agent_native(model, synthesis_messages, ctx).strip()
+        return run_agent_fallback(model, synthesis_messages, ctx).strip()
+    except Exception as e:
+        return f"Synthesis error: {e}"
+
+
+def run_spawn_agents(model, task, ctx, count=1):
+    count = max(1, min(int(count), 5))
+    spawn_model = _resolve_spawn_model(model, ctx)
+    if not spawn_model:
+        return "Spawn aborted: no 2B-or-smaller model is available for subagents."
+
+    info(f"Spawning {count} subagent(s) to divide the work with {spawn_model}...")
+    parts = _split_task_for_agents(task, count)
+    results = []
+
+    for idx, part in enumerate(parts, 1):
+        submessages = [{"role": "system", "content": build_system_prompt(ctx)}]
+        submessages.append({
+            "role": "user",
+            "content": (
+                f"You are subagent {idx}/{count}. Focus only on the following subtask and "
+                f"return a concise, actionable result. Do not repeat the full task.\n\n"
+                f"Subtask: {part}"
+            ),
+        })
+
+        try:
+            if ctx.get("_supports_tools"):
+                output = run_agent_native(spawn_model, submessages, ctx)
+            else:
+                output = run_agent_fallback(spawn_model, submessages, ctx)
+        except Exception as e:
+            output = f"Subagent {idx} error: {e}"
+
+        cleaned = output.strip()
+        results.append(f"Subagent {idx}/{count}: {cleaned}")
+
+    synthesized = _synthesize_spawn_results(spawn_model, task, results, ctx)
+    return "\n\n".join([
+        "Spawn plan:",
+        "\n\n".join(results),
+        "\n\nFinal synthesis:",
+        synthesized,
+    ])
+
+
+def _spawn_command(args, ctx):
+    parts = args.strip().split(None, 1)
+    if not parts:
+        warn("Usage: /spawn <n> [task]")
+        return None
+    try:
+        count = int(parts[0])
+    except ValueError:
+        warn("Usage: /spawn <n> [task]")
+        return None
+    task = parts[1].strip() if len(parts) > 1 else ""
+    if not task:
+        task = "Please break this request into N parts and work on the most important first steps."
+    result = run_spawn_agents(ctx.get("model"), task, ctx, count=count)
+    print(result)
+    return None
+
+
 def _exit_command(args, ctx):
     raise SystemExit(0)
 
@@ -1333,6 +1495,7 @@ SKILLS = [
     Skill("no",        "Turn off auto-confirm.",                               _no_command),
     Skill("save",      "Save session to Markdown/JSON: /save [path]",          _save_command),
     Skill("load",      "Load session from JSON: /load <path>",                 _load_command),
+    Skill("spawn",     "Spawn N subagents to divide a task: /spawn 3 <goal>", _spawn_command),
 ]
 
 
@@ -1384,6 +1547,20 @@ def handle_command(line, ctx):
             return True
     warn(f"Unknown command: {stripped.split(None,1)[0]}.  Type /help.")
     return True
+
+
+def parse_spawn_request(line):
+    import re
+    match = re.search(
+        r"\bspawn\s+(\d+)\s+(?:agents?|subagents?)\b",
+        line,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None, None
+    count = int(match.group(1))
+    task = line[match.end():].strip()
+    return count, task
 
 
 # --- REPL -------------------------------------------------------------------
@@ -1455,6 +1632,15 @@ def run_chat(ctx):
             break
 
         if not user_input:
+            continue
+
+        spawn_count, spawn_task = parse_spawn_request(user_input)
+        if spawn_count is not None:
+            task = spawn_task or user_input
+            result = run_spawn_agents(model, task, ctx, count=spawn_count)
+            messages.append({"role": "user", "content": user_input})
+            messages.append({"role": "assistant", "content": result})
+            _auto_save_session()
             continue
 
         # Slash commands.
