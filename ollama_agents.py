@@ -21,10 +21,15 @@ Usage:
 """
 
 import argparse
+import html
 import json
 import os
+import re
+import shlex
+import subprocess
 import sys
 import textwrap
+import urllib.parse
 
 # Force UTF-8 on Windows so Rich markup never crashes cp1252 terminals.
 # (Belt-and-braces: nothing in this file uses non-ASCII anyway.)
@@ -241,17 +246,106 @@ def list_models():
 
 # --- Web search -------------------------------------------------------------
 
+def run_command(command, cwd=None, timeout=120):
+    """Run a local shell command and return stdout/stderr."""
+    if not command:
+        return "Error: no command provided."
+    if isinstance(command, str):
+        try:
+            parts = shlex.split(command)
+        except ValueError as e:
+            return f"Error parsing command: {e}"
+    else:
+        parts = list(command)
+    if not parts:
+        return "Error: no command provided."
+    try:
+        completed = subprocess.run(
+            parts,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            shell=False,
+        )
+        output_parts = []
+        if completed.stdout.strip():
+            output_parts.append(completed.stdout.strip())
+        if completed.stderr.strip():
+            output_parts.append(completed.stderr.strip())
+        body = "\n\n".join(output_parts).strip()
+        if body:
+            return f"Exit code: {completed.returncode}\n\n{body}"
+        return f"Exit code: {completed.returncode}"
+    except FileNotFoundError:
+        return f"Error: command not found: {parts[0]}"
+    except subprocess.TimeoutExpired:
+        return f"Error: command timed out after {timeout} seconds."
+    except Exception as e:
+        return f"Error running command: {e}"
+
+
+def fetch_url(url, timeout=30):
+    """Fetch a URL and return readable text content."""
+    if not url:
+        return "Error: missing URL."
+    cleaned = str(url).strip()
+    if not cleaned:
+        return "Error: missing URL."
+    if not cleaned.startswith(("http://", "https://")):
+        cleaned = "https://" + cleaned
+    req = urllib.request.Request(cleaned, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            content = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        return f"Error fetching {cleaned}: {e}"
+    text = re.sub(r"<script[\s\S]*?</script>", " ", content, flags=re.I)
+    text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(re.sub(r"\s+", " ", text)).strip()
+    if not text:
+        return f"Fetched {cleaned}\n\n(no readable text found)"
+    preview = text[:4000]
+    return f"Fetched {cleaned}\n\n{preview}"
+
+
 def web_search(query: str, n: int = DEFAULT_N_RESULTS) -> str:
-    """Run a DuckDuckGo search and return formatted results."""
+    """Search the web, or fetch a direct URL when the query is a link."""
+    q = (query or "").strip()
+    if not q:
+        return "Error: empty search query."
+    if q.startswith(("http://", "https://")):
+        return fetch_url(q)
     if not HAS_DDG:
-        return "Error: duckduckgo-search package not installed."
+        try:
+            search_url = "https://duckduckgo.com/html/?q=" + urllib.parse.quote(q)
+            req = urllib.request.Request(search_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                html_text = resp.read().decode("utf-8", errors="replace")
+        except Exception as e:
+            return f"Search error: {e}"
+        matches = re.findall(r'<a rel="nofollow" class="result__a" href="(.*?)".*?>(.*?)</a>', html_text, flags=re.S)
+        results = []
+        for href, title in matches[:n]:
+            cleaned_href = html.unescape(re.sub(r"^/l/\?uddg=", "", href))
+            cleaned_title = html.unescape(re.sub(r"<[^>]+>", " ", title))
+            results.append({"title": re.sub(r"\s+", " ", cleaned_title).strip(), "href": cleaned_href})
+        if not results:
+            return f"No results found for: {q}"
+        lines = [f"Web search results for: '{q}'", f"Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M')}", ""]
+        for i, r in enumerate(results, 1):
+            lines.append(f"[{i}] {r.get('title', 'No title')}")
+            lines.append(f"    URL: {r.get('href', '')}")
+            lines.append("")
+        return "\n".join(lines)
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=n))
+            results = list(ddgs.text(q, max_results=n))
         if not results:
-            return f"No results found for: {query}"
+            return f"No results found for: {q}"
         lines = [
-            f"Web search results for: '{query}'",
+            f"Web search results for: '{q}'",
             f"Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
             "",
         ]
@@ -263,6 +357,31 @@ def web_search(query: str, n: int = DEFAULT_N_RESULTS) -> str:
         return "\n".join(lines)
     except Exception as e:
         return f"Search error: {e}"
+
+
+def repair_self(path, old_string, new_string, auto_confirm=False):
+    """Safely patch a project file in place using the same write logic.
+
+    This is intentionally narrow: it can only edit files inside the project root
+    and only when the old text is found exactly once.
+    """
+    repo_root = os.path.abspath(os.path.dirname(__file__))
+    abs_path = os.path.abspath(os.path.join(repo_root, path))
+    if os.path.commonpath([repo_root, abs_path]) != repo_root:
+        return f"Error: refusing to edit outside project root: {path}"
+    if not os.path.exists(abs_path):
+        return f"Error: file not found: {abs_path}"
+    try:
+        with open(abs_path, encoding="utf-8", errors="replace") as fh:
+            content = fh.read()
+    except Exception as e:
+        return f"Error reading {abs_path}: {e}"
+    if old_string not in content:
+        return f"Error: old_string not found in {abs_path}"
+    if content.count(old_string) > 1:
+        return f"Error: old_string found multiple times in {abs_path}"
+    new_content = content.replace(old_string, new_string, 1)
+    return tool_write_file(abs_path, new_content, auto_confirm=auto_confirm)
 
 
 # --- RAG (ChromaDB + nomic-embed-text) --------------------------------------
@@ -489,6 +608,22 @@ def tool_read_file(path):
         return f"Error reading {path}: {e}"
 
 
+def tool_list_dir(path="."):
+    abs_path = _resolve_path(path)
+    try:
+        entries = sorted(os.listdir(abs_path))
+        if not entries:
+            return f"Directory is empty: {abs_path}"
+        preview = "\n".join(entries[:200])
+        return f"Directory: {abs_path}\n\n{preview}"
+    except FileNotFoundError:
+        return f"Error: directory not found: {abs_path}"
+    except PermissionError:
+        return f"Error: permission denied: {abs_path}"
+    except Exception as e:
+        return f"Error listing {abs_path}: {e}"
+
+
 def tool_write_file(path, content, auto_confirm=False):
     abs_path = _resolve_path(path)
     action = "create" if not os.path.exists(abs_path) else "overwrite"
@@ -664,14 +799,13 @@ def build_tools(enable_rag=True, enable_file_tools=True):
             "function": {
                 "name": "web_search",
                 "description": (
-                    "Search the public internet (DuckDuckGo) for current information: "
-                    "news, prices, weather, recent events, anything after the model's "
-                    "knowledge cutoff. Returns a list of result snippets with URLs."
+                    "Search the public internet for current information, or fetch a direct URL "
+                    "when the user gives a link."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string", "description": "The search query."},
+                        "query": {"type": "string", "description": "The search query or full URL."},
                         "num_results": {"type": "integer",
                                         "description": "How many results to return (default 5).",
                                         "default": 5},
@@ -679,7 +813,56 @@ def build_tools(enable_rag=True, enable_file_tools=True):
                     "required": ["query"],
                 },
             },
-        }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "fetch_url",
+                "description": "Open and read a specific URL directly, returning the fetched text content.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "The full URL to fetch."},
+                    },
+                    "required": ["url"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_command",
+                "description": "Run a local shell command and return the output. Use this for git clone, pip install, python scripts, and other CLI tasks.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": ["string", "array"],
+                            "description": "Shell command as a string or argv list.",
+                        },
+                        "cwd": {"type": "string", "description": "Optional working directory for the command."},
+                        "timeout": {"type": "integer", "description": "Timeout in seconds.", "default": 120},
+                    },
+                    "required": ["command"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "repair_self",
+                "description": "Patch this project file in place to fix or improve the agent implementation. Use only for scoped changes inside the repository.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to the file to edit, relative to the project root."},
+                        "old_string": {"type": "string", "description": "Exact existing text to replace."},
+                        "new_string": {"type": "string", "description": "Replacement text."},
+                    },
+                    "required": ["path", "old_string", "new_string"],
+                },
+            },
+        },
     ]
     if enable_rag:
         tools.append({
@@ -706,6 +889,20 @@ def build_tools(enable_rag=True, enable_file_tools=True):
         })
     if enable_file_tools:
         tools.extend([
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_dir",
+                    "description": "List the contents of a directory so the agent can inspect or organize files on the machine.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Directory path to list."},
+                        },
+                        "required": [],
+                    },
+                },
+            },
             {
                 "type": "function",
                 "function": {
@@ -776,6 +973,9 @@ information, web searches, file operations, or anything requiring external data.
 
 Rules:
 - When the user asks you to search, call web_search immediately.
+- When the user is given a URL, call fetch_url directly to read it.
+- When the user asks to run commands, install packages, clone repos, or execute scripts, call run_command.
+- When the user asks the agent to improve or repair itself, call repair_self for scoped edits to project files.
 - When the user asks about their files or code, call search_docs.
 - Do not refuse to use tools. Do not say tools are unavailable.
 - Be direct and concise. Use markdown, no emoji.
@@ -808,6 +1008,10 @@ these tags in your output then STOP and wait for the result:
 
   SEARCH: <query>
   SEARCH_DOCS: <query>
+  FETCH_URL: <url>
+  RUN_COMMAND: <command>
+  REPAIR_SELF: <path>
+  LIST_DIR: <path>
   READ_FILE: <path>
   WRITE_FILE: <path>
   ...content...
@@ -859,10 +1063,40 @@ def extract_tool_calls(text):
             if q:
                 calls.append(("search_docs", {"query": q}))
             i += 1
+        elif upper.startswith("FETCH_URL:"):
+            u = s[len("FETCH_URL:"):].strip()
+            if u:
+                calls.append(("fetch_url", {"url": u}))
+            i += 1
+        elif upper.startswith("RUN_COMMAND:"):
+            cmd = s[len("RUN_COMMAND:"):].strip()
+            if cmd:
+                calls.append(("run_command", {"command": cmd}))
+            i += 1
+        elif upper.startswith("REPAIR_SELF:"):
+            p = s[len("REPAIR_SELF:"):].strip()
+            if p:
+                rest, end_i = _read_block(text, i + 1, "END_REPAIR_SELF")
+                if "---" in rest:
+                    old, new = rest.split("---", 1)
+                    calls.append(("repair_self", {
+                        "path": p,
+                        "old_string": old.strip("\n"),
+                        "new_string": new.strip("\n"),
+                    }))
+                else:
+                    calls.append(("repair_self", {"path": p}))
+                i = end_i
+            else:
+                i += 1
         elif upper.startswith("READ_FILE:"):
             p = s[len("READ_FILE:"):].strip()
             if p:
                 calls.append(("read_file", {"path": p}))
+            i += 1
+        elif upper.startswith("LIST_DIR:"):
+            p = s[len("LIST_DIR:"):].strip()
+            calls.append(("list_dir", {"path": p or "."}))
             i += 1
         elif upper.startswith("WRITE_FILE:"):
             p = s[len("WRITE_FILE:"):].strip()
@@ -934,6 +1168,52 @@ def dispatch_tool_call(name, args, ctx):
         else:
             print(f"\n>> search_docs: {q}")
         return search_docs(q, k)
+
+    if name == "fetch_url":
+        url = args.get("url", "")
+        if HAS_RICH and console is not None:
+            console.print(Panel(
+                f"[bold blue]fetch_url[/bold blue]  {url}",
+                border_style="blue", padding=(0, 1)))
+        else:
+            print(f"\n>> fetch_url: {url}")
+        return fetch_url(url)
+
+    if name == "run_command":
+        command = args.get("command", "")
+        cwd = args.get("cwd")
+        timeout = args.get("timeout", 120)
+        if HAS_RICH and console is not None:
+            console.print(Panel(
+                f"[bold magenta]run_command[/bold magenta]  {command}",
+                border_style="magenta", padding=(0, 1)))
+        else:
+            print(f"\n>> run_command: {command}")
+        return run_command(command, cwd=cwd, timeout=int(timeout))
+
+    if name == "repair_self":
+        path = args.get("path", "")
+        old_string = args.get("old_string", "")
+        new_string = args.get("new_string", "")
+        if HAS_RICH and console is not None:
+            console.print(Panel(
+                f"[bold red]repair_self[/bold red]  {path}",
+                border_style="red", padding=(0, 1)))
+        else:
+            print(f"\n>> repair_self: {path}")
+        return repair_self(path, old_string, new_string, auto_confirm=auto)
+
+    if name == "list_dir":
+        if not enable_files:
+            return "File tools are disabled in this session."
+        path = args.get("path", ".")
+        if HAS_RICH and console is not None:
+            console.print(Panel(
+                f"[bold green]list_dir[/bold green]  {path}",
+                border_style="green", padding=(0, 1)))
+        else:
+            print(f"\n>> list_dir: {path}")
+        return tool_list_dir(path)
 
     if name == "read_file":
         if not enable_files:
