@@ -21,6 +21,7 @@ Usage:
 """
 
 import argparse
+import base64
 import html
 import json
 import os
@@ -30,6 +31,7 @@ import subprocess
 import sys
 import textwrap
 import urllib.parse
+import urllib.request
 
 # Force UTF-8 on Windows so Rich markup never crashes cp1252 terminals.
 # (Belt-and-braces: nothing in this file uses non-ASCII anyway.)
@@ -83,8 +85,8 @@ OLLAMA_BASE = "http://localhost:11434"
 DEFAULT_MODEL = "qwen3.5:9b"
 DEFAULT_N_RESULTS = 5
 DEFAULT_EMBED_MODEL = "nomic-embed-text:latest"
-MAX_TOOL_ROUNDS = 8
-MAX_HISTORY = 50  # messages retained per session
+MAX_TOOL_ROUNDS = 16
+MAX_HISTORY = 100  # messages retained per session
 
 console = Console() if HAS_RICH else None
 
@@ -357,6 +359,83 @@ def web_search(query: str, n: int = DEFAULT_N_RESULTS) -> str:
         return "\n".join(lines)
     except Exception as e:
         return f"Search error: {e}"
+
+
+def analyze_image_with_gemini(image_path: str, prompt: str = "Describe this image in detail. If it contains code, errors, or UI elements, explain them thoroughly.") -> str:
+    """Analyze an image using Google's Gemini API.
+
+    Reads the image file, encodes it as base64, and sends it to the
+    Gemini 1.5 Flash API with the provided prompt. Requires GEMINI_API_KEY
+    environment variable to be set.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        return ("Error: GEMINI_API_KEY or GOOGLE_API_KEY environment variable not set. "
+                "Please set it to use image analysis.")
+
+    if not os.path.exists(image_path):
+        return f"Error: Image file not found: {image_path}"
+
+    try:
+        with open(image_path, "rb") as f:
+            image_data = f.read()
+        image_b64 = base64.b64encode(image_data).decode("utf-8")
+
+        ext = os.path.splitext(image_path)[1].lower()
+        mime_types = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+            ".gif": "image/gif",
+            ".bmp": "image/bmp",
+        }
+        mime_type = mime_types.get(ext, "image/png")
+
+        models_to_try = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash", "gemini-2.5-pro"]
+        last_error = ""
+        for model_name in models_to_try:
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+                payload = {
+                    "contents": [{
+                        "parts": [
+                            {"text": prompt},
+                            {"inline_data": {"mime_type": mime_type, "data": image_b64}}
+                        ]
+                    }],
+                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4096}
+                }
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    result = json.loads(resp.read().decode("utf-8"))
+
+                candidates = result.get("candidates", [])
+                if not candidates:
+                    continue
+                content = candidates[0].get("content", {})
+                parts = content.get("parts", [])
+                if not parts:
+                    continue
+                text = parts[0].get("text", "")
+                if text:
+                    return text.strip()
+            except urllib.error.HTTPError as e:
+                error_body = e.read().decode("utf-8", errors="replace")
+                last_error = f"Gemini API error ({e.code}) with {model_name}: {error_body}"
+                continue
+            except Exception as e:
+                last_error = f"Error with {model_name}: {e}"
+                continue
+
+        return f"Error: All Gemini models failed. {last_error}" if last_error else "Error: All Gemini models failed to analyze the image."
+    except Exception as e:
+        return f"Error analyzing image: {e}"
 
 
 def repair_self(path, old_string, new_string, auto_confirm=False):
@@ -863,6 +942,27 @@ def build_tools(enable_rag=True, enable_file_tools=True):
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "analyze_image",
+                "description": ("Analyze an image file using the Gemini API. "
+                                "Pass a local file path to an image (png, jpg, jpeg, webp, gif) "
+                                "and get a detailed description/transcription. "
+                                "Requires GEMINI_API_KEY environment variable."),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string",
+                                 "description": "Absolute or relative path to the image file."},
+                        "prompt": {"type": "string",
+                                   "description": "Optional custom prompt for the analysis.",
+                                   "default": "Describe this image in detail. If it contains code, errors, or text, transcribe it fully."},
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
     ]
     if enable_rag:
         tools.append({
@@ -977,6 +1077,8 @@ Rules:
 - When the user asks to run commands, install packages, clone repos, or execute scripts, call run_command.
 - When the user asks the agent to improve or repair itself, call repair_self for scoped edits to project files.
 - When the user asks about their files or code, call search_docs.
+- When given an image path or asked to analyze an image, call analyze_image.
+- Before calling any tool, FIRST explain what you are about to do and why.
 - Do not refuse to use tools. Do not say tools are unavailable.
 - Be direct and concise. Use markdown, no emoji.
 - Cite source URLs when using web search.
@@ -1021,6 +1123,9 @@ these tags in your output then STOP and wait for the result:
   ---
   <new>
   END_EDIT_FILE
+  ANALYZE_IMAGE: <path>
+  <prompt>
+  END_ANALYZE_IMAGE
 
 Do NOT guess results. After I return the tool output, continue your answer.
 """
@@ -1122,6 +1227,17 @@ def extract_tool_calls(text):
                 i = end_i
             else:
                 i += 1
+        elif upper.startswith("ANALYZE_IMAGE:"):
+            p = s[len("ANALYZE_IMAGE:"):].strip()
+            if p:
+                prompt_text, next_i = _read_block(text, i + 1, "END_ANALYZE_IMAGE")
+                calls.append(("analyze_image", {
+                    "path": p,
+                    "prompt": prompt_text.strip() or "Describe this image in detail. If it contains code, errors, or text, transcribe it fully.",
+                }))
+                i = next_i
+            else:
+                i += 1
         else:
             i += 1
     return calls
@@ -1203,6 +1319,17 @@ def dispatch_tool_call(name, args, ctx):
             print(f"\n>> repair_self: {path}")
         return repair_self(path, old_string, new_string, auto_confirm=auto)
 
+    if name == "analyze_image":
+        path = args.get("path", "")
+        prompt = args.get("prompt", "Describe this image in detail. If it contains code, errors, or text, transcribe it fully.")
+        if HAS_RICH and console is not None:
+            console.print(Panel(
+                f"[bold magenta]analyze_image[/bold magenta]  {path}",
+                border_style="magenta", padding=(0, 1)))
+        else:
+            print(f"\n>> analyze_image: {path}")
+        return analyze_image_with_gemini(path, prompt)
+
     if name == "list_dir":
         if not enable_files:
             return "File tools are disabled in this session."
@@ -1265,6 +1392,7 @@ def run_agent_native(model, messages, ctx):
     tools = build_tools(enable_rag=ctx.get("enable_rag", True),
                         enable_file_tools=ctx.get("enable_file_tools", True))
     collected_text = ""
+    _nudge_count = 0
 
     for _ in range(MAX_TOOL_ROUNDS):
         header(f"{model}")
@@ -1293,9 +1421,63 @@ def run_agent_native(model, messages, ctx):
 
         if not final_tool_calls:
             local_messages.append({"role": "assistant", "content": collected_text})
-            break
+            lowered = collected_text.lower()
+            if (any(marker in lowered for marker in [
+                "task complete", "final answer", "here's", "here is",
+                "in summary", "to summarize", "let me know if",
+            ]) or len(collected_text) > 150) or _nudge_count >= 2:
+                break
+            _nudge_count += 1
+            local_messages.append({
+                "role": "user",
+                "content": (
+                    "You did not call any tools. If the task requires "
+                    "searching, running commands, reading files, or any "
+                    "external action, call the appropriate tool. "
+                    "Do NOT just repeat your previous answer."
+                ),
+            })
+            continue
 
-        # Record the assistant turn (including any tool_calls it made).
+        # Show the user what the model plans to do and ask for confirmation
+        # BEFORE recording the assistant message (so rejected tool_calls
+        # don't pollute history).
+        if not ctx.get("auto_confirm", False):
+            tool_names = []
+            for tc in final_tool_calls:
+                fn = (tc or {}).get("function", {}) or {}
+                fname = fn.get("name", "")
+                args = fn.get("arguments", {}) or {}
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args) if args.strip() else {}
+                    except Exception:
+                        args = {}
+                desc = fname
+                if fname == "run_command":
+                    desc += f": {args.get('command', '')}"
+                elif fname in ("write_file", "edit_file", "repair_self"):
+                    desc += f": {args.get('path', '')}"
+                elif fname == "analyze_image":
+                    desc += f": {args.get('path', '')}"
+                elif fname == "web_search":
+                    desc += f": {args.get('query', '')[:80]}"
+                tool_names.append(desc)
+            print()
+            info("The agent wants to run:")
+            for t in tool_names:
+                print(f"  - {t}")
+            if not _confirm_action("Execute these tool calls?"):
+                warn("Tool calls blocked by user.")
+                # Record assistant without tool_calls so the model can continue
+                local_messages.append({"role": "assistant", "content": collected_text})
+                local_messages.append({
+                    "role": "user",
+                    "content": "The user rejected the tool calls. Do NOT retry the same tools. Instead, continue your response without executing tools."
+                })
+                continue
+
+        # Record the assistant turn now (only after confirmed).
         local_messages.append({
             "role": "assistant",
             "content": collected_text,
@@ -1331,7 +1513,14 @@ def run_agent_fallback(model, messages, ctx):
     handlers the native tool-calling loop uses.
     """
     local_messages = messages[:]
+    # Swap the system prompt to INJECTION_SYSTEM so the model knows to emit tags
+    # instead of using native tool calling.
+    if local_messages and local_messages[0].get("role") == "system":
+        local_messages[0] = {"role": "system", "content": INJECTION_SYSTEM}
+    else:
+        local_messages.insert(0, {"role": "system", "content": INJECTION_SYSTEM})
     collected_text = ""
+    _nudge_count = 0
 
     for _ in range(MAX_TOOL_ROUNDS):
         header(f"{model} (fallback)")
@@ -1358,7 +1547,48 @@ def run_agent_fallback(model, messages, ctx):
         tool_calls = extract_tool_calls(collected_text)
         if not tool_calls:
             local_messages.append({"role": "assistant", "content": collected_text})
-            break
+            lowered = collected_text.lower()
+            if (any(marker in lowered for marker in [
+                "task complete", "final answer", "here's", "here is",
+                "in summary", "to summarize", "let me know if",
+            ]) or len(collected_text) > 150) or _nudge_count >= 2:
+                break
+            _nudge_count += 1
+            local_messages.append({
+                "role": "user",
+                "content": (
+                    "You did not call any tools. If the task requires "
+                    "searching, running commands, reading files, or any "
+                    "external action, you MUST emit the appropriate tag "
+                    "and try again. Do NOT just repeat what you said."
+                ),
+            })
+            continue
+
+        # Show the user what the model plans to do BEFORE recording the
+        # assistant message (so rejected tool_calls don't pollute history).
+        if not ctx.get("auto_confirm", False):
+            print()
+            info("The agent wants to run:")
+            for name, args in tool_calls:
+                desc = name
+                if name == "run_command":
+                    desc += f": {args.get('command', '')}"
+                elif name in ("write_file", "edit_file", "repair_self"):
+                    desc += f": {args.get('path', '')}"
+                elif name == "analyze_image":
+                    desc += f": {args.get('path', '')}"
+                elif name == "web_search":
+                    desc += f": {args.get('query', '')[:80]}"
+                print(f"  - {desc}")
+            if not _confirm_action("Execute these tool calls?"):
+                warn("Tool calls blocked by user.")
+                local_messages.append({"role": "assistant", "content": collected_text})
+                local_messages.append({
+                    "role": "user",
+                    "content": "The user rejected the tool calls. Do NOT retry the same tools. Instead, continue your response without executing tools."
+                })
+                continue
 
         local_messages.append({"role": "assistant", "content": collected_text})
         for name, args in tool_calls:
@@ -1744,6 +1974,59 @@ def _exit_command(args, ctx):
     raise SystemExit(0)
 
 
+def _image_command(args, ctx):
+    """Analyze an image via Gemini API."""
+    path = args.strip()
+    if not path:
+        warn("Usage: /image <path_to_image> [optional prompt]")
+        return None
+    parts = path.split(None, 1)
+    img_path = parts[0]
+    prompt = parts[1] if len(parts) > 1 else "Describe this image in detail. If it contains code, errors, or text, transcribe it fully."
+
+    # Resolve the path
+    resolved = os.path.expanduser(img_path)
+    if not os.path.isabs(resolved):
+        resolved = os.path.abspath(resolved)
+    if not os.path.exists(resolved):
+        warn(f"Image not found: {resolved}")
+        return None
+
+    # Ask user before proceeding
+    if not ctx.get("auto_confirm", False):
+        info(f"Will analyze: {resolved}")
+        try:
+            ans = input(f"  Proceed with image analysis? [Y/n] ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            warn("Cancelled.")
+            return None
+        if ans not in {"", "y", "yes"}:
+            warn("Cancelled.")
+            return None
+
+    if HAS_RICH and console is not None:
+        console.print(Panel(
+            f"[bold magenta]analyze_image[/bold magenta]  {resolved}",
+            border_style="magenta", padding=(0, 1)))
+    else:
+        print(f"\n>> analyze_image: {resolved}")
+    result = analyze_image_with_gemini(resolved, prompt)
+
+    # Show the result and feed it to the LLM
+    if HAS_RICH and console is not None:
+        console.print(Panel(
+            result, title="[bold]Gemini Analysis[/bold]",
+            border_style="magenta"))
+    else:
+        print(f"\n=== Gemini Analysis ===\n{result}")
+
+    # Feed the analysis result into the conversation so the local agent can act on it
+    msgs = ctx.get("messages", [])
+    if msgs and msgs[0].get("role") == "system":
+        msgs.append({"role": "user", "content": f"Here is an image analysis result that I need you to act on:\n\n{result}"})
+    return None
+
+
 def _help_command(args, ctx):
     if HAS_RICH and console is not None:
         tbl = Table(title="Slash Commands", box=box.ROUNDED,
@@ -1776,6 +2059,7 @@ SKILLS = [
     Skill("save",      "Save session to Markdown/JSON: /save [path]",          _save_command),
     Skill("load",      "Load session from JSON: /load <path>",                 _load_command),
     Skill("spawn",     "Spawn N subagents to divide a task: /spawn 3 <goal>", _spawn_command),
+    Skill("image",     "Analyze an image via Gemini: /image <path> [prompt]", _image_command),
 ]
 
 
@@ -1860,6 +2144,39 @@ def prompt_user(ctx):
     return line
 
 
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff", ".tif"}
+
+
+def _is_image_path(text):
+    """Check if text is or starts with a path to an image file."""
+    # Check the whole input
+    candidate = text.strip()
+    if os.path.isfile(candidate) and os.path.splitext(candidate)[1].lower() in _IMAGE_EXTENSIONS:
+        return candidate
+    # Check if it starts with a path (e.g. "image.png what does this mean?")
+    parts = candidate.split(None, 1)
+    if parts and os.path.isfile(parts[0]) and os.path.splitext(parts[0])[1].lower() in _IMAGE_EXTENSIONS:
+        return parts[0]
+    # Handle quoted paths with spaces
+    if candidate.startswith('"') or candidate.startswith("'"):
+        quote = candidate[0]
+        end = candidate.find(quote, 1)
+        if end > 0:
+            p = candidate[1:end]
+            if os.path.isfile(p) and os.path.splitext(p)[1].lower() in _IMAGE_EXTENSIONS:
+                return p
+    return None
+
+
+def _confirm_action(description):
+    """Ask the user to confirm an action. Returns True if confirmed."""
+    try:
+        ans = input(f"  {description}\n  Proceed? [Y/n] ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        return False
+    return ans in {"", "y", "yes"}
+
+
 def run_chat(ctx):
     model = ctx["model"]
     sys_prompt = build_system_prompt(ctx)  # noqa
@@ -1912,6 +2229,24 @@ def run_chat(ctx):
             break
 
         if not user_input:
+            continue
+
+        # Auto-detect dragged/dropped image files
+        img_path = _is_image_path(user_input)
+        if img_path:
+            info(f"Detected image: {img_path}")
+            if not _confirm_action(f"Analyze {os.path.basename(img_path)} with Gemini API and send result to the agent?"):
+                continue
+            result = analyze_image_with_gemini(img_path)
+            if HAS_RICH and console is not None:
+                console.print(Panel(
+                    result, title="[bold]Gemini Analysis[/bold]",
+                    border_style="magenta"))
+            else:
+                print(f"\n=== Gemini Analysis ===\n{result}")
+            # Feed the analysis into the conversation
+            messages.append({"role": "user", "content": f"Here is an analysis of the image {os.path.basename(img_path)}:\n\n{result}"})
+            _auto_save_session()
             continue
 
         spawn_count, spawn_task = parse_spawn_request(user_input)

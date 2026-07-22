@@ -33,6 +33,10 @@ END_REPAIR_SELF"""
         self.assertEqual(calls[0][1]["old_string"], "old text")
         self.assertEqual(calls[0][1]["new_string"], "new text")
 
+    def test_resolve_rag_paths_uses_current_directory_by_default(self):
+        paths = ollama_agents.resolve_rag_paths([], no_rag=False, cwd="/tmp/project")
+        self.assertEqual(paths, ["/tmp/project"])
+
 
 if __name__ == "__main__":
     unittest.main()
